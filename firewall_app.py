@@ -1,46 +1,89 @@
 """
-firewall_app.py  –  Ryu OpenFlow application
-Holds all firewall state, packet inspection logic, and RPC methods.
-The WSGI/REST layer lives in firewall_wsgi.py.
+firewall_app.py  –  (Ryu) OpenFlow controller based on "simple switch 13"
+Holds all firewall state and packet inspection logic.
 """
 
 import json
+import logging
 import time
+import struct
+from collections import defaultdict
+from enum import Enum
+from collections import deque
 
-from ryu.app import simple_switch_13
+from ryu.base import app_manager
 from ryu.app.wsgi import WSGIApplication, rpc_public
 from ryu.controller import ofp_event
-from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER
-from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp, arp
+from ryu.controller.handler import set_ev_cls, MAIN_DISPATCHER, CONFIG_DISPATCHER
+from ryu.lib.packet import packet, ethernet, ether_types, ipv4, tcp, udp, arp, ipv6, icmp
 from ryu.ofproto import ofproto_v1_3
+
 
 # Imported here so firewall_wsgi.py can reference it without a circular import
 FIREWALL_INSTANCE = 'firewall_app'
 WS_URL            = '/firewall/ws'
 
+class CheckResult(Enum):
+    # (level, msg_template, stat_key, extra_tag)
+    ALLOWED           = ('allow', 'Packet allowed',              None,            'ALLOWED')
+    IP_BLOCKED        = ('block', 'IP blocked: {src}',           'blocked',       'IP_BLOCK')
+    IP_NOT_ALLOWLIST  = ('block', 'IP not in allowlist: {src}',  'blocked',       'IP_ALLOWLIST')
+    PORT_BLOCKED      = ('block', '{proto} port {port} blocked', 'blocked',       'PORT_BLOCK')
+    RATE_LIMITED      = ('block', 'Rate limit exceeded: {src}',  'rate_limited',  'RATE_LIMIT')
+    ARP_SPOOF         = ('warn',  'ARP spoof: {src}',            'arp_spoof',     'ARP_SPOOF')
+    XMAS_SCAN         = ('warn',  'Xmas scan from {src}',        'scan_detected', 'XMAS_SCAN')
+    NULL_SCAN         = ('warn',  'NULL scan from {src}',        'scan_detected', 'NULL_SCAN')
+    SYN_FIN           = ('warn',  'SYN+FIN from {src}',          'scan_detected', 'MALFORMED')
+    SYN_RST           = ('warn',  'SYN+RST from {src}',          'scan_detected', 'MALFORMED')
+    ACK_SCAN          = ('warn',  'ACK scan from {src}',         'scan_detected', 'MALFORMED')
+    FIN_SCAN          = ('warn',  'FIN scan from {src}',         'scan_detected', 'MALFORMED')
 
-class FirewallApp(simple_switch_13.SimpleSwitch13):
+    def __init__(self, level: str, msg_template: str, stat_key: str | None, extra_tag: str):
+        self.level        = level
+        self.msg_template = msg_template
+        self.stat_key     = stat_key
+        self.extra_tag    = extra_tag
+
+    def resolve(self, **kwargs) -> str:
+        """Render the message template with provided kwargs."""
+        return self.msg_template.format(**kwargs)
+    @property
+    def is_blocked(self) -> bool:
+        return self != CheckResult.ALLOWED
+
+class FirewallApp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS    = {'wsgi': WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super(FirewallApp, self).__init__(*args, **kwargs)
 
-        # ── Firewall state ───────────────────────────────────────────────────
+        # actual routing information
+        self.mac_to_port = defaultdict(dict)
+        # ip  → mac  (ARP spoof detection)
+        self.arp_table     = {}
+
+        self.datapaths: dict[int, any] = {}
+
+
+        # set of IPv4 src ips to block
         self.blocked_ips   = set()
-        self.blocked_ports = set()   # TCP/UDP dst ports to drop
-        self.allowed_ips   = set()   # if non-empty → default-deny for unlisted IPs
-        self.arp_table     = {}      # ip  → mac  (ARP spoof detection)
-        self.rate_tracker  = {}      # ip  → [timestamps]
-        self.rate_limit    = 100     # max packets per window
-        self.rate_window   = 10      # window size in seconds
+        # set of (dst_port, proto_num) tuples to block
+        self.blocked_ports = set()
+        # if non-empty → default-deny for unlisted IPs
+        self.allowed_ips   = set()
+        # ip → deque of packet timestamps within the current rate window
+        self.rate_tracker: dict[str, deque] = {}
+        # max packets per window
+        self.rate_limit    = 1000
+        # window size in seconds
+        self.rate_window   = 1.0
 
         # ── Event log (capped at 200) ────────────────────────────────────────
         self.event_log = []
 
         # ── Counters ─────────────────────────────────────────────────────────
         self.stats = {
-            'total':         0,
             'allowed':       0,
             'blocked':       0,
             'arp_spoof':     0,
@@ -71,10 +114,10 @@ class FirewallApp(simple_switch_13.SimpleSwitch13):
         mapper.connect('/firewall/rules/ip/{ip}',
             controller=name, action='del_blocked_ip',
             conditions=dict(method=['DELETE']))
-        mapper.connect('/firewall/rules/port/{port}',
+        mapper.connect('/firewall/rules/port/{port}/{proto}',
             controller=name, action='add_blocked_port',
             conditions=dict(method=['POST']))
-        mapper.connect('/firewall/rules/port/{port}',
+        mapper.connect('/firewall/rules/port/{port}/{proto}',
             controller=name, action='del_blocked_port',
             conditions=dict(method=['DELETE']))
         mapper.connect('/firewall/rules/ratelimit',
@@ -107,135 +150,412 @@ class FirewallApp(simple_switch_13.SimpleSwitch13):
         self._ws_manager.broadcast(json.dumps({'type': 'event', 'data': entry}))
         self._ws_manager.broadcast(json.dumps({'type': 'stats', 'data': dict(self.stats)}))
 
-    def add_flow(self, datapath, priority, match, actions, idle_timeout=0):
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0, buffer_id=None):
+        """
+            Install the actual rule to save the 'flow' for next time
+        """
         ofproto = datapath.ofproto
-        parser  = datapath.ofproto_parser
+        parser = datapath.ofproto_parser
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod  = parser.OFPFlowMod(
+        kw = dict(
             datapath=datapath, priority=priority,
-            idle_timeout=idle_timeout,
+            idle_timeout=idle_timeout, hard_timeout=hard_timeout,
             match=match, instructions=inst)
+        if buffer_id is not None:
+            kw['buffer_id'] = buffer_id
+        mod = parser.OFPFlowMod(**kw)
         datapath.send_msg(mod)
 
-    # ── Firewall checks ──────────────────────────────────────────────────────
-
-    def _check_ip_block(self, datapath, src_ip, dst_ip):
-        if src_ip in self.blocked_ips:
+    def _flush_flows_for_ip(self, ip_src):
+        """
+            Delete any active ip flow for the specified address source (used to block a previously allowed address)
+        """
+        self._log('info', f'flushing flows for {ip_src}, datapaths: {list(self.datapaths.keys())}')
+        for datapath in self.datapaths.values():
+            ofproto = datapath.ofproto
             parser = datapath.ofproto_parser
-            match  = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
-            self.add_flow(datapath, priority=100, match=match, actions=[])
-            self.stats['blocked'] += 1
-            self._log('block', f'IP blocked: {src_ip}', src=src_ip, dst=dst_ip)
-            return True
-        if self.allowed_ips and src_ip not in self.allowed_ips:
-            self.stats['blocked'] += 1
-            self._log('block', f'IP not in allowlist: {src_ip}', src=src_ip)
-            return True
-        return False
+            match_src = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src)                                               # flush flows where blocked IP is source
+            match_dst = parser.OFPMatch(eth_type=0x0800, ipv4_dst=ip_src)                                               # flush flows where blocked IP is destination
 
-    def _check_port_block(self, datapath, proto_num, dst_port, src_ip):
-        if dst_port in self.blocked_ports:
+            for match in [match_src, match_dst]:
+                mod = parser.OFPFlowMod(
+                    datapath=datapath,
+                    command=ofproto.OFPFC_DELETE,                                                                       # delete current flows
+                    match=match,
+                    out_port=ofproto.OFPP_ANY,
+                    out_group=ofproto.OFPG_ANY)
+                datapath.send_msg(mod)
+
+    def _check_ip_block(self, datapath, ip_src, ip_dst) -> CheckResult:
+        """
+            Check if the source of the ip(v4) packet:
+                - is in blocked_ips -> add the rule to ignore other packets from it and return an IP_BLOCKED error
+                - is not in allowed_ips (if not empty) -> return an IP_NOT_ALLOWLIST error
+        """
+        # TODO: GOON FROM HERE @.@
+        # need to check how to handle the block removal
+        if ip_src in self.blocked_ips:                                                                                  # blacklist only on src ip
             parser = datapath.ofproto_parser
-            kw     = {'tcp_dst': dst_port} if proto_num == 6 else {'udp_dst': dst_port}
-            match  = parser.OFPMatch(eth_type=0x0800, ip_proto=proto_num, **kw)
-            self.add_flow(datapath, priority=200, match=match, actions=[])
-            self.stats['blocked'] += 1
-            proto = 'TCP' if proto_num == 6 else 'UDP'
-            self._log('block', f'{proto} port {dst_port} blocked',
-                      src=src_ip, extra=f'port={dst_port}')
-            return True
-        return False
+            ofproto = datapath.ofproto
 
-    def _check_rate_limit(self, src_ip):
+            match_arp = parser.OFPMatch(eth_type=0x0806, arp_spa=ip_src)                                                # allow ARP from blocked host (so MAC resolution still works)
+            self.add_flow(datapath, priority=200, match=match_arp, actions=[parser.OFPActionOutput(ofproto.OFPP_FLOOD)])
+
+            match_ip = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src)                                                # match any ipv4 packets coming from the ip specified in blocked_ips
+            self.add_flow(datapath, priority=100, match=match_ip, actions=[])                                           # void actions -> ignore the packets (high priority to be one of the first rules to check)
+            return CheckResult.IP_BLOCKED
+
+        if self.allowed_ips and ip_src not in self.allowed_ips:                                                         # inverse logic (whitelist) handler
+            return CheckResult.IP_NOT_ALLOWLIST
+
+        return CheckResult.ALLOWED
+
+    def _check_ip_rate_limit(self, datapath, ip_src) -> CheckResult:
+        """
+            Check for time-rate ip packets from a same source
+            Keep a timestamp dequeue 'tracker' associated to each source and check the number of timestamps in the time window 'rate_window'
+        """
         now = time.time()
-        self.rate_tracker.setdefault(src_ip, [])
-        self.rate_tracker[src_ip] = [
-            t for t in self.rate_tracker[src_ip] if now - t < self.rate_window]
-        self.rate_tracker[src_ip].append(now)
-        if len(self.rate_tracker[src_ip]) > self.rate_limit:
-            self.stats['rate_limited'] += 1
-            self._log('block', f'Rate limit exceeded: {src_ip}', src=src_ip,
-                      extra=f'{len(self.rate_tracker[src_ip])} pkts/{self.rate_window}s')
-            return True
-        return False
+        self.rate_tracker.setdefault(ip_src, deque())                                                                   # using optimized deque
+        tracker = self.rate_tracker[ip_src]                                                                             # get the associated deque object
 
-    def _check_arp_spoof(self, src_mac, src_ip):
-        if src_ip not in self.arp_table:
-            self.arp_table[src_ip] = src_mac
-            return False
-        if self.arp_table[src_ip] != src_mac:
-            self.stats['arp_spoof'] += 1
-            self._log('warn',
-                      f'ARP spoof: {src_ip} claimed by {src_mac} '
-                      f'(known: {self.arp_table[src_ip]})',
-                      src=src_mac, extra='ARP_SPOOF')
-            return True
-        return False
+        while tracker and now - tracker[0] >= self.rate_window:                                                         # keep the sliding window to the fixed TIME size
+            tracker.popleft()
 
-    def _check_tcp_flags(self, tcp_pkt, src_ip):
-        f = tcp_pkt.bits
-        FIN, SYN, PSH, URG = 0x01, 0x02, 0x08, 0x20
-        if f & (FIN | PSH | URG) == (FIN | PSH | URG):
-            self.stats['scan_detected'] += 1
-            self._log('warn', f'Xmas scan from {src_ip}',  src=src_ip, extra='XMAS_SCAN')
-            return True
-        if f == 0:
-            self.stats['scan_detected'] += 1
-            self._log('warn', f'NULL scan from {src_ip}',  src=src_ip, extra='NULL_SCAN')
-            return True
-        if f & (SYN | FIN) == (SYN | FIN):
-            self.stats['scan_detected'] += 1
-            self._log('warn', f'SYN+FIN from {src_ip}',   src=src_ip, extra='MALFORMED')
-            return True
-        return False
+        if len(tracker) >= self.rate_limit:                                                                             # check if in the fixed TIME size the number of packets (their timestamps) is greater than allowed
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src)
+            self.add_flow(datapath, priority=200, match=match, actions=[], idle_timeout=10)                             # expire after 10s to allow recovery
+            return CheckResult.RATE_LIMITED
+
+        tracker.append(now)                                                                                             # add a timestamp as the rate is small enough
+        return CheckResult.ALLOWED
+
+    def _check_port_block(self, datapath, proto_num, dst_port, ip_src) -> CheckResult:
+        """
+            Check if the port is defined as blocked in blocked_ports.
+            If it is in blocked_ports -> add the rule to ignore other packets at the exact (port, protocol) combination and return a PORT_BLOCKED error
+
+        """
+        if (dst_port, proto_num) in self.blocked_ports:
+            parser = datapath.ofproto_parser
+            kw = None
+            if proto_num == 6:
+                kw = {'tcp_dst': dst_port}
+            elif proto_num == 17:
+                kw = {'udp_dst': dst_port}
+            else:
+                return CheckResult.ALLOWED                                                                              # for now blocked protocols are only tcp and udp, the others are allowed
+            match = parser.OFPMatch(eth_type=0x0800, ip_proto=proto_num, **kw)
+            self.add_flow(datapath, priority=200, match=match, actions=[])
+            return CheckResult.PORT_BLOCKED
+
+        return CheckResult.ALLOWED
+
+    def _check_tcp_flags(self, datapath, tcp_pkt, ip_src) -> CheckResult:
+        """
+            Check for invalid TCP flags configurations
+            return the specific flag error as CheckResult value or ALLOWED for valid configurations
+        """
+        flags_bits = tcp_pkt.bits
+        # bit:  7    6    5    4    3    2    1    0
+        # flag: CWR  ECE  URG  ACK  PSH  RST  SYN  FIN
+        #                 0x20 0x10 0x08 0x04 0x02 0x01
+        FIN, SYN, RST, PSH, ACK, URG = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20                                               # saving position of each flag to filter "bits" value
+
+        result = CheckResult.ALLOWED
+
+        if flags_bits & (FIN | PSH | URG) == (FIN | PSH | URG):                                                         # all 3 flags up -> not valid configuration
+            result = CheckResult.XMAS_SCAN                                                                              # XMAS cause they're "lit up"
+        if flags_bits == 0:                                                                                             # no flag up -> not valid configuration
+            result = CheckResult.NULL_SCAN                                                                              # NULL cause it's a null byte
+        if flags_bits & (SYN | FIN) == (SYN | FIN):                                                                     # SYN and FIN both active ->  not valid configuration
+            result = CheckResult.SYN_FIN
+        if flags_bits & (SYN | RST) == (SYN | RST):                                                                     # like SYN and FIN
+            result = CheckResult.SYN_RST
+        if flags_bits == ACK:
+            result = CheckResult.ACK_SCAN                                                                               # only ACK active as first packet -> probably a scan (like nmap)
+        if flags_bits == FIN:
+            result = CheckResult.FIN_SCAN                                                                               # probably a scan
+
+        if result != CheckResult.ALLOWED:
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(eth_type=0x0800, ip_proto=6, ipv4_src=ip_src)                                       # match IPv4 TCP messages from current source IP address
+            self.add_flow(datapath, priority=200, match=match, actions=[], idle_timeout=60)                             # drop them (30s for recovery)
+            return result
+
+        return result
+
+    def _check_arp_spoof(self, datapath, src_mac, ip_src) -> CheckResult:
+        """
+            Check for a new mac address associated to a previously associated ip
+            return ARP_SPOOF if the ip-mac combination is not as expected
+            return ALLOWED if a new ip-mac combination is found (and store it in 'arp_table')
+        """
+        if ip_src not in self.arp_table:
+            self.arp_table[ip_src] = src_mac                                                                            # learn a new mac address
+            return CheckResult.ALLOWED
+        elif self.arp_table[ip_src] != src_mac:                                                                         # signal the changing mac address
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(eth_type=0x0806, arp_spa=ip_src)                                                    # drop ARP from the current ipv4 address
+            self.add_flow(datapath, priority=200, match=match, actions=[], idle_timeout=60)                             # drop them (30s for recovery)
+            return CheckResult.ARP_SPOOF
+        else:
+            return CheckResult.ALLOWED
+
+    def _apply_result(self, result: CheckResult, src, dst='', **kwargs):
+        """Update stats and log based on CheckResult."""
+        if result.stat_key:
+            self.stats[result.stat_key] += 1
+
+        self._log(
+            result.level,
+            result.resolve(src=src, dst=dst, **kwargs),
+            src=src, dst=dst,
+            extra=result.extra_tag
+        )
+
+
+    def icmp_packet_handler(self, msg, icmp_pkt) -> CheckResult:
+        """
+            TODO: GOON HERE @.@
+        """
+        # icmp packet:
+        # {
+        #   'type': 8,
+        #   'code': 0,
+        #   'csum': 2541,
+        #   'data': echo(
+        #     id=22013,
+        #     seq=1,
+        #     data=b'0A\xb4i\x00\x00\x00\x00\xef\x96\x05\x00\x00\x00\x00\x00'
+        #          b'\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f'
+        #          b' !"#$%&\'()*+,-./01234567'
+        #   )
+        # }
+
+        return CheckResult.ALLOWED
+
+    def udp_packet_handler(self, datapath, ip_src, ip_dst, udp_pkt) -> CheckResult:
+        """
+            No specific check for now, only blocked port usage
+        """
+        result = self._check_port_block(datapath, 17, udp_pkt.dst_port, ip_src)
+        return result
+
+    def tcp_packet_handler(self, datapath, ip_src, ip_dst, tcp_pkt) -> CheckResult:
+        """
+            Check for blocked port usage and TCP flags misusage
+        """
+        checks = [
+            lambda: self._check_port_block(datapath, 6, tcp_pkt.dst_port, ip_src),
+            lambda: self._check_tcp_flags(datapath, tcp_pkt, ip_src),
+        ]
+        for check in checks:                                                                                            # python magic, for loop to run 2 functions
+            result = check()
+            if result != CheckResult.ALLOWED:
+                return result
+        return CheckResult.ALLOWED
+
+    def ipv4_packet_handler(self, msg, ip_pkt) -> CheckResult:
+        # example dump got from icmp packet
+        # {
+        #   'protocols': ['ethernet', 'ipv4', 'icmp'],
+        #   'eth': {
+        #     'dst':       'ce:2a:19:a0:b0:00',
+        #     'src':       '96:31:b6:f6:8e:f4',
+        #     'ethertype': 2048
+        #   },
+        #   'ip': {
+        #     'version':       4,
+        #     'header_length': 5,
+        #     'tos':           0,
+        #     'total_length':  84,
+        #     'identification': 1717,
+        #     'flags':         2,
+        #     'offset':        0,
+        #     'ttl':           64,
+        #     'proto':         1,
+        #     'csum':          8178,
+        #     'src':           '10.0.0.1',
+        #     'dst':           '10.0.0.2',
+        #     'option':        None
+        #   }
+        # }
+        datapath = msg.datapath
+        pkt = packet.Packet(msg.data)
+        ip_src = ip_pkt.src
+        ip_dst = ip_pkt.dst
+        result = CheckResult.ALLOWED
+
+        # IP-packet level checks:
+        # - blocked addresses (static blacklist)
+        # - packet rate limit
+        # (using lambda expressions to avoid if-else tree)
+        checks = [
+            lambda: self._check_ip_block(datapath, ip_src, ip_dst),
+            lambda: self._check_ip_rate_limit(datapath, ip_src),
+        ]
+
+        for check in checks:
+            result = check()
+            if result != CheckResult.ALLOWED:
+                return result
+
+        # checks divided into multiple helper functions to be more readable
+        if ip_pkt.proto == 1:                                                                                           # ICMP protocol -> IP packet>protocol field = 1
+            icmp_pkt = pkt.get_protocol(icmp.icmp)
+            result = self.icmp_packet_handler(msg, icmp_pkt)
+        elif ip_pkt.proto == 6:                                                                                         # TCP protocol -> IP packet>protocol field = 6
+            tcp_pkt = pkt.get_protocol(tcp.tcp)
+            result = self.tcp_packet_handler(datapath, ip_src, ip_dst, tcp_pkt)
+        elif ip_pkt.proto == 17:                                                                                        # UDP protocol -> IP packet>protocol field = 17
+            udp_pkt = pkt.get_protocol(udp.udp)
+            result = self.udp_packet_handler(datapath, ip_src, ip_dst, udp_pkt)
+        else:                                                                                                           # other packets are free to be transmitted (not inspected)
+            result = CheckResult.ALLOWED
+        return result
+
+    def arp_packet_handler(self, msg, arp_pkt) -> CheckResult:
+        """
+            Check only for ARP spoof for now
+            return value depend only the function _check_arp_spoof
+        """
+        # {
+        #   'protocols': ['ethernet', 'arp'],
+        #   'eth': {
+        #     'dst':       'ff:ff:ff:ff:ff:ff',
+        #     'src':       '96:31:b6:f6:8e:f4',
+        #     'ethertype': 2054
+        #   },
+        #   'arp': {
+        #     'hwtype':  1,
+        #     'proto':   2048,
+        #     'hlen':    6,
+        #     'plen':    4,
+        #     'opcode':  1,
+        #     'src_mac': '96:31:b6:f6:8e:f4',
+        #     'src_ip':  '10.0.0.1',
+        #     'dst_mac': '00:00:00:00:00:00',
+        #     'dst_ip':  '10.0.0.2'
+        #   },
+        # }
+        result = self._check_arp_spoof(msg.datapath, arp_pkt.src_mac, arp_pkt.src_ip)
+        return result
+
+    # ── Handshake handler ────────────────────────────────────────────────────
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_handshake_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        self.datapaths[datapath.id] = datapath
+
+        # install only a table-miss flow entry (rest of the logic here in the controller)
+        match = parser.OFPMatch()  # match everything
+        actions = [
+            parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, 65535)]  # can specify a limit, it's using ovs version 3
+        self.arp_table.clear()  # avoid old data issues
+        self.add_flow(datapath, 0, match, actions)  # priority 0, ignore if there's something else
 
     # ── Packet-in handler ────────────────────────────────────────────────────
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        super(FirewallApp, self)._packet_in_handler(ev)
+        if not ev.msg or not ev.msg.data:
+            self.logger.warn(f"packet with no msg or data: even context: {ev}")
+            return
+        elif ev.msg.msg_len < ev.msg.total_len:                                                                         # base ignored case
+            self.logger.warn(f"packet truncated: only {ev.msg.msg_len} of {ev.msg.total_len} bytes")
+            return
 
-        msg      = ev.msg
+        msg = ev.msg                                                                                                    # data extraction from ev object
         datapath = msg.datapath
-        pkt      = packet.Packet(msg.data)
+        ofproto = datapath.ofproto
+        dpid = format(datapath.id, "d").zfill(16)
+        parser = datapath.ofproto_parser
 
+        # ------ filtering area ------
+        pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
-        arp_pkt = pkt.get_protocol(arp.arp)
-        ip_pkt  = pkt.get_protocol(ipv4.ipv4)
+        result = CheckResult.ALLOWED                                                                                    # sanity check section (initially set as ALLOWED)
 
-        self.stats['total'] += 1
+        if eth_pkt.ethertype == 2048:                                                                                   # IPv4 ethernet frame: 0x0800 -> 2048
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            result = self.ipv4_packet_handler(msg, ip_pkt)
+        elif eth_pkt.ethertype == 2054:                                                                                 # ARP ethernet frame: 0x806 -> 2054
+            arp_pkt = pkt.get_protocol(arp.arp)
+            result = self.arp_packet_handler(msg, arp_pkt)
+        elif eth_pkt.ethertype == 34525:                                                                                # IPv6 ethernet frame: 0x86DD -> 34525
+            # ipv6_pkt = pkt.get_protocol(ipv6.ipv6)                                                                    # analysis of IPv6 packets is not implemented
+            self.logger.warn(f"ipv6 packet ignored")
+            return
+        elif eth_pkt.ethertype == 35020:                                                                                # DataLink-Layer-Discovery (periodic, multicast) frame: 0x88CC -> 35020
+            self.logger.warn(f"DLLD packet ignored")                                                                    # analysis of DLLD is not implemented
+            return
+        else:
+            self.logger.warn(f"Ethertype {eth_pkt.ethertype} ignored")
+            return
 
-        if arp_pkt:
-            if self._check_arp_spoof(eth_pkt.src, arp_pkt.src_ip):
-                return
+        # ------ filter outcome application area ------
 
-        if ip_pkt:
-            src_ip = ip_pkt.src
-            dst_ip = ip_pkt.dst
+        eth_dst = getattr(eth_pkt, 'dst', None)
+        eth_src = getattr(eth_pkt, 'src', None)
+        in_port = msg.match['in_port']
+        out_port = None
+        self.mac_to_port[dpid][eth_src] = in_port                                                                       # learn MAC (store the combo (eth_src, in_port) to the specific datapath id)
 
-            if self._check_ip_block(datapath, src_ip, dst_ip):
-                return
-            if self._check_rate_limit(src_ip):
-                return
+        if result != CheckResult.ALLOWED:                                                                               # (single) exit point for blocked packets
+            log_proto = ''
+            log_port = 0
+            if eth_pkt.ethertype != 2048:
+                log_src = eth_src
+                log_dst = eth_dst
+            else:
+                ip_pkt = pkt.get_protocol(ipv4.ipv4)                                                                    # refetch data from ip_pkt, less efficient but more readable
+                ip_src = getattr(ip_pkt, 'src', None)
+                ip_dst = getattr(ip_pkt, 'dst', None)
+                log_src = ip_src
+                log_dst = ip_dst
+                if result == CheckResult.PORT_BLOCKED:
+                    #log_port = tcp_pkt.dst_port if tcp_pkt else udp_pkt.dst_port                                       # too much python-like
+                    log_port = struct.unpack('!H', ip_pkt.payload[2:4])[0]                                       # dst port is at bytes 2-4 for both TCP and UDP (a bit faster)
+                    if ip_pkt.proto == 6:
+                        log_proto = 'TCP'
+                    elif ip_pkt.proto == 17:
+                        log_proto = 'UDP'
+                    else:
+                        log_proto = f'{ip_pkt.proto}'
+            self._apply_result(result, src=log_src, dst=log_dst, proto=log_proto, port=log_port)
+        else:                                                                                                           # routing for allowed packets
+            if eth_dst in self.mac_to_port[dpid]:
+                out_port = self.mac_to_port[dpid][eth_dst]
+            else:
+                out_port = ofproto.OFPP_FLOOD
 
-            tcp_pkt = pkt.get_protocol(tcp.tcp)
-            if tcp_pkt:
-                if self._check_tcp_flags(tcp_pkt, src_ip):
+            actions = [parser.OFPActionOutput(out_port)]
+
+            if out_port != ofproto.OFPP_FLOOD:                                                                          # check if it's a known path
+                match = parser.OFPMatch(in_port=in_port, eth_dst=eth_dst, eth_src=eth_src)                              # install the new flow
+                if msg.buffer_id != ofproto.OFP_NO_BUFFER:
+                    self.add_flow(datapath, priority=1, match=match, actions=actions, buffer_id=msg.buffer_id, idle_timeout=0, hard_timeout=0)  # specify the buffer in which this message is stored in the switch
                     return
-                if self._check_port_block(datapath, 6, tcp_pkt.dst_port, src_ip):
-                    return
+                else:
+                    self.add_flow(datapath, priority=1, match=match, actions=actions, buffer_id=None, idle_timeout=0, hard_timeout=0)           # flow-only rule
 
-            udp_pkt = pkt.get_protocol(udp.udp)
-            if udp_pkt:
-                if self._check_port_block(datapath, 17, udp_pkt.dst_port, src_ip):
-                    return
+            data = None
+            if msg.buffer_id == ofproto.OFP_NO_BUFFER:                                                                  # send back the entire message (no buffer == no copy in the switch)
+                data = msg.data
 
-            self.stats['allowed'] += 1
+            out = parser.OFPPacketOut(
+                datapath=datapath,
+                buffer_id=msg.buffer_id,
+                in_port=in_port,
+                actions=actions,
+                data=data,
+            )
+            datapath.send_msg(out)                                                                                      # send the message with data and action of the current (inspected) packet
 
-        self._ws_manager.broadcast(json.dumps({
-            'type': 'packet',
-            'data': str(pkt)[:120],
-        }))
+
 
     # ── WebSocket RPC (callable from JS via JSON-RPC over WS) ───────────────
 

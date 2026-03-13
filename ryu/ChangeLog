@@ -1,0 +1,5 @@
+CHANGES
+=======
+
+* Dummy firewall with basic non-functional GUI. TODO: revise the code. Next: add deeper inspection
+* Initial commit

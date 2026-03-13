@@ -49,6 +49,7 @@ class FirewallWSGI(ControllerBase):
 
     def add_blocked_ip(self, req, ip, **_kw):
         self.app.blocked_ips.add(ip)
+        self.app._flush_flows_for_ip(ip)
         self.app._log('info', f'Rule added: block IP {ip}', src=ip)
         return self._json({'status': 'ok', 'blocked_ips': list(self.app.blocked_ips)})
 
@@ -57,14 +58,14 @@ class FirewallWSGI(ControllerBase):
         self.app._log('info', f'Rule removed: unblock IP {ip}', src=ip)
         return self._json({'status': 'ok', 'blocked_ips': list(self.app.blocked_ips)})
 
-    def add_blocked_port(self, req, port, **_kw):
-        self.app.blocked_ports.add(int(port))
-        self.app._log('info', f'Rule added: block port {port}')
+    def add_blocked_port(self, req, port, proto, **_kw):
+        self.app.blocked_ports.add((int(port), int(proto)))
+        self.app._log('info', f'Rule added: block protocol {proto} at port {port}')
         return self._json({'status': 'ok', 'blocked_ports': list(self.app.blocked_ports)})
 
-    def del_blocked_port(self, req, port, **_kw):
-        self.app.blocked_ports.discard(int(port))
-        self.app._log('info', f'Rule removed: unblock port {port}')
+    def del_blocked_port(self, req, port, proto, **_kw):
+        self.app.blocked_ports.discard((int(port), int(proto)))
+        self.app._log('info', f'Rule removed: unblock protocol {proto} at port {port}')
         return self._json({'status': 'ok', 'blocked_ports': list(self.app.blocked_ports)})
 
     def set_rate_limit(self, req, **_kw):
