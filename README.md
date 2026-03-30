@@ -3,26 +3,43 @@ Basic SDN Firewall implemented with Ryu and tested with Mininet. Local-only web 
 
 
 ## Installation & Usage
-> Tested on Acer with i5-10210U, 16GB RAM, 512GB SSD — Ubuntu 24.04.3 LTS, kernel 6.17.0-14-generic
+> Tested on Acer with i5-10210U, 16GB RAM, 512GB SSD — Ubuntu 24.04.3 LTS (and Linux Mint 22.2), kernel 6.17.0-14-generic
 
 ### Install & Run
 ```bash
+# global libraries
 sudo add-apt-repository ppa:deadsnakes/ppa -y
 sudo apt update
-sudo apt-get install -y git python3.10 python3.10-venv python3-distutils python3.10-dev python3-pip python-is-python3 xterm # main prerequisites to use the libraries (xterm just for mininet external terminals, pythonispython3 just cause I tend to forget the 3 at the end)
+sudo apt install -y git xterm python3-pip python3.12 python3.12-venv python3.12-dev python3-pip openvswitch-switch
+
+# project istallation
 git clone https://github.com/GioeleSe/SDN_firewall/
 cd SDN_firewall
-source .venv/bin/activate
-python main.py
-# on a split terminal start mininet with the command
-sudo mn --controller remote # remote controller option to be able to connect it with the python-exposed controller at default port
+
+# local libraries (from patched source)
+source ./.venv/bin/activate
+ ./.venv/bin/python3 -m pip install ./ryu/
+ ./.venv/bin/python3 -m pip install ./mininet/
+make ./mininet/mnexec
+sudo install -v ./mininet/mnexec /usr/local/bin/
+
+# project start
+sudo systemctl start openvswitch-switch  # enable ovs as background service 
+.venv/bin/python3 main.py				        # on one terminal start the controller app
+sudo ./.venv/bin/mn --controller remote		# on the other terminal start mininet
+
+
 ```
 
 ### Uninstall
 ```bash
-Ctrl+C  # to stop the (foreground) process of the server (and the mininet on the other terminal)
-deactivate # exit from the python virtual environment
-cd .. && sudo rm -rf SDN_firewall # just delete the directory
+# stopping the project
+Ctrl+C                            # to stop the (foreground) process of the server (and the mininet on the other terminal)
+deactivate                       # exit from the python virtual environment
+sudo systemctl stop openvswitch-switch    # stop the background service
+
+# uninstalling the project:	
+cd .. && sudo rm -rf SDN_firewall
 ```
 
 ---
